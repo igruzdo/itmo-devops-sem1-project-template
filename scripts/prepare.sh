@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS prices (
     name TEXT NOT NULL,
     category TEXT NOT NULL,
     price NUMERIC NOT NULL,
-    create_date DATE NOT NULL
+    create_date TIMESTAMP NOT NULL
 );
 EOF
 echo "Таблица 'prices' готова!"

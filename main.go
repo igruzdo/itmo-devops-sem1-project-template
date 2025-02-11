@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"database/sql"
 	"encoding/csv"
 	"encoding/json"
@@ -22,7 +23,6 @@ var db *sql.DB
 
 func main() {
 	// Подключение к PostgreSQL
-
 	dbHost := getEnv("POSTGRES_HOST", "localhost")
 	dbPort := getEnv("POSTGRES_PORT", "5432")
 	dbUser := getEnv("POSTGRES_USER", "validator")
@@ -85,34 +85,20 @@ func handlePostPrices(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Загружен файл: %s\n", handler.Filename)
 
-	// Сохраняем файл временно на диск
-	tempFile, err := os.CreateTemp("", "upload-*.zip")
+	// Читаем содержимое файла в память
+	fileBytes, err := io.ReadAll(file)
 	if err != nil {
-		http.Error(w, "Не удалось сохранить файл", http.StatusInternalServerError)
-		return
-	}
-	defer os.Remove(tempFile.Name()) // Удаляем временный файл после обработки
-
-	log.Printf("Создан временный файл: %s", tempFile.Name())
-
-	// Копируем содержимое загруженного файла во временный файл
-	_, err = io.Copy(tempFile, file)
-	if err != nil {
-		http.Error(w, "Ошибка сохранения файла", http.StatusInternalServerError)
-		log.Printf("Ошибка сохранения файла: %v", err)
+		http.Error(w, "Ошибка чтения файла", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("Временный файл: %s\n", tempFile.Name())
-
-	// Разархивируем файл
-	zipReader, err := zip.OpenReader(tempFile.Name())
+	// Открываем ZIP-архив из памяти
+	zipReader, err := zip.NewReader(bytes.NewReader(fileBytes), int64(len(fileBytes)))
 	if err != nil {
 		http.Error(w, "Ошибка разархивации файла", http.StatusBadRequest)
 		log.Printf("Ошибка разархивации файла: %v", err)
 		return
 	}
-	defer zipReader.Close()
 
 	var csvFile string
 	for _, f := range zipReader.File {
@@ -133,6 +119,11 @@ func handlePostPrices(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Ошибка начала транзакции", http.StatusInternalServerError)
 		return
 	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
 
 	// Читаем содержимое CSV-файла
 	var totalItems int
@@ -175,7 +166,7 @@ func handlePostPrices(w http.ResponseWriter, r *http.Request) {
 				createDate := record[4]
 
 				// Сохраняем в базу данных
-				_, err = db.Exec(
+				_, err = tx.Exec(
 					"INSERT INTO prices (name, category, price, create_date) VALUES ($1, $2, $3, $4)",
 					name, category, price, createDate,
 				)
@@ -190,34 +181,27 @@ func handlePostPrices(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Подсчет total_price и total_categories по всей таблице в рамках транзакции
+	var totalPrice float64
+	var totalCategories int
+
+	// Запрос для подсчета суммарной стоимости и количества категорий
+	err = tx.QueryRow("SELECT SUM(price), COUNT(DISTINCT category) FROM prices").Scan(&totalPrice, &totalCategories)
+	if err != nil {
+		http.Error(w, "Ошибка получения статистики", http.StatusInternalServerError)
+		return
+	}
+
 	// Завершаем транзакцию
 	if err := tx.Commit(); err != nil {
 		http.Error(w, "Ошибка завершения транзакции", http.StatusInternalServerError)
 		return
 	}
 
-	// Подсчет total_price и total_categories по всем объектам в таблице
-	var totalPrice float64
-	var totalCategories int
-
-	// Запрос для подсчета суммарной стоимости
-	err = db.QueryRow("SELECT SUM(price) FROM prices").Scan(&totalPrice)
-	if err != nil {
-		http.Error(w, "Ошибка получения суммарной стоимости", http.StatusInternalServerError)
-		return
-	}
-
-	// Запрос для подсчета уникальных категорий
-	err = db.QueryRow("SELECT COUNT(DISTINCT category) FROM prices").Scan(&totalCategories)
-	if err != nil {
-		http.Error(w, "Ошибка получения количества категорий", http.StatusInternalServerError)
-		return
-	}
-
 	// Формируем JSON-ответ
 	response := map[string]interface{}{
 		"total_items":      totalItems,
-		"total_categories": len(categories),
+		"total_categories": totalCategories,
 		"total_price":      totalPrice,
 	}
 
@@ -234,15 +218,9 @@ func handleGetPrices(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	csvFile, err := os.CreateTemp("", "data-*.csv")
-	if err != nil {
-		http.Error(w, "Ошибка создания временного файла", http.StatusInternalServerError)
-		log.Printf("Ошибка создания файла: %v", err)
-		return
-	}
-	defer os.Remove(csvFile.Name())
-
-	writer := csv.NewWriter(csvFile)
+	// Создаем CSV-файл в памяти
+	var csvBuffer bytes.Buffer
+	writer := csv.NewWriter(&csvBuffer)
 	writer.Write([]string{"id", "name", "category", "price", "create_date"})
 
 	for rows.Next() {
@@ -275,22 +253,9 @@ func handleGetPrices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = csvFile.Seek(0, io.SeekStart)
-	if err != nil {
-		http.Error(w, "Ошибка сброса указателя CSV-файла", http.StatusInternalServerError)
-		log.Printf("Ошибка сброса указателя CSV-файла: %v", err)
-		return
-	}
-
-	zipFile, err := os.CreateTemp("", "data-*.zip")
-	if err != nil {
-		http.Error(w, "Ошибка создания ZIP-файла", http.StatusInternalServerError)
-		log.Printf("Ошибка создания ZIP-файла: %v", err)
-		return
-	}
-	defer os.Remove(zipFile.Name())
-
-	zipWriter := zip.NewWriter(zipFile)
+	// Создаем ZIP-файл в памяти
+	var zipBuffer bytes.Buffer
+	zipWriter := zip.NewWriter(&zipBuffer)
 	fileWriter, err := zipWriter.Create("data.csv")
 	if err != nil {
 		http.Error(w, "Ошибка добавления файла в ZIP", http.StatusInternalServerError)
@@ -298,7 +263,7 @@ func handleGetPrices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = io.Copy(fileWriter, csvFile)
+	_, err = fileWriter.Write(csvBuffer.Bytes())
 	if err != nil {
 		http.Error(w, "Ошибка копирования данных в ZIP", http.StatusInternalServerError)
 		log.Printf("Ошибка копирования данных в ZIP: %v", err)
@@ -313,5 +278,5 @@ func handleGetPrices(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", "attachment; filename=\"data.zip\"")
-	http.ServeFile(w, r, zipFile.Name())
+	w.Write(zipBuffer.Bytes())
 }
